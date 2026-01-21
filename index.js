@@ -2,7 +2,7 @@ const Discord = require('discord.js');
 const Voice = require('@discordjs/voice');
 
 /**
- * --- KONFIGURATION ---
+ * --- Configuration ---
  */
 const CONFIG = {
     token: 'YOUR_BOT_TOKEN',
@@ -11,16 +11,10 @@ const CONFIG = {
     dest: { guildId: 'SERVER_B_ID', channelId: 'CHANNEL_B_ID' }
 };
 
-/**
- * Intents als Zahlenwerte (129 = Guilds + GuildVoiceStates)
- */
 const client = new Discord.Client({
     intents: [1, 128] 
 });
 
-/**
- * AudioPlayer mit optimiertem Puffer
- */
 const player = Voice.createAudioPlayer({
     behaviors: { 
         noSubscriber: Voice.NoSubscriberBehavior.Play,
@@ -28,18 +22,14 @@ const player = Voice.createAudioPlayer({
     }
 });
 
-/**
- * Funktion zum Aufbau und Überwachen der Brücke
- */
 async function establishBridge() {
-    // Verhindert mehrfache Verbindungen zum gleichen Server
     if (Voice.getVoiceConnection(CONFIG.source.guildId)) return;
 
     try {
         const guildA = await client.guilds.fetch(CONFIG.source.guildId);
         const guildB = await client.guilds.fetch(CONFIG.dest.guildId);
 
-        console.log(`[${new Date().toLocaleTimeString()}] 🔗 Verbinde: ${guildA.name} -> ${guildB.name}`);
+        console.log(`[${new Date().toLocaleTimeString()}] 🔗 Connected: ${guildA.name} -> ${guildB.name}`);
 
         const connA = Voice.joinVoiceChannel({
             channelId: CONFIG.source.channelId,
@@ -57,22 +47,16 @@ async function establishBridge() {
 
         connB.subscribe(player);
 
-        /**
-         * AUTO-REAKTIVIERUNGS-LOGIK
-         * Wir hören auf das 'start' Signal des Spielers.
-         * Falls der Stream eingeschlafen ist, starten wir ihn neu.
-         */
         connA.receiver.speaking.on('start', (userId) => {
             if (userId !== CONFIG.playerId) return;
             
-            // Wenn der Player gerade nicht spielt (Idle/Buffering), "wecken" wir ihn auf
             if (player.state.status !== Voice.AudioPlayerStatus.Playing) {
-                console.log("🎙️ Stimme erkannt - Stream wird reaktiviert...");
+                console.log("🎙️ Voice found.");
                 
                 const opusStream = connA.receiver.subscribe(userId, {
                     end: { 
                         behavior: Voice.EndBehaviorType.AfterSilence, 
-                        duration: 2000 // Hält die Leitung 2 Sekunden nach dem Reden offen
+                        duration: 2000
                     },
                 });
 
@@ -83,15 +67,14 @@ async function establishBridge() {
 
                 player.play(resource);
                 
-                // Erzwingt den "Sprechend"-Status auf Server B
                 connB.setSpeaking(true);
             }
         });
 
-        console.log("✅ Brücke bereit und aktiv.");
+        console.log("✅ Bridge ready and activ.");
 
     } catch (err) {
-        console.error("❌ Fehler beim Aufbau:", err.message);
+        console.error("❌ Error:", err.message);
     }
 }
 
@@ -109,14 +92,11 @@ function destroyBridge() {
     }
     
     player.stop();
-    console.log(`[${new Date().toLocaleTimeString()}] ⏹️ Brücke gestoppt.`);
+    console.log(`[${new Date().toLocaleTimeString()}] Bridge stopped.`);
 }
 
-/**
- * Bot Status Events
- */
 client.once('ready', async () => {
-    console.log(`🚀 Bot eingeloggt als ${client.user.tag}`);
+    console.log(`Bot logged in as ${client.user.tag}`);
     try {
         const guildA = await client.guilds.fetch(CONFIG.source.guildId);
         const member = await guildA.members.fetch(CONFIG.playerId).catch(() => null);
@@ -125,13 +105,10 @@ client.once('ready', async () => {
             establishBridge();
         }
     } catch (e) {
-        console.error("Initialprüfung fehlgeschlagen.");
+        console.error("Initialization failed");
     }
 });
 
-/**
- * Automatisches Folgen bei Kanalwechsel
- */
 client.on('voiceStateUpdate', (oldState, newState) => {
     if (newState.id !== CONFIG.playerId) return;
     
@@ -145,7 +122,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
 });
 
-// Fehlerbehandlung
 client.on('error', console.error);
+
 
 client.login(CONFIG.token);
