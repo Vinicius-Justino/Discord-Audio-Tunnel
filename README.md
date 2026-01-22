@@ -31,7 +31,7 @@ The bot connects to two different Discord voice servers simultaneously. By subsc
 
 ```bash
 # Clone the repository
-git clone [https://github.com/YOUR_USERNAME/discord-voice-bridge.git](https://github.com/YOUR_USERNAME/discord-voice-bridge.git)
+git clone [https://github.com/TTom03/Discord-Audio-Mirroring.git](https://github.com/TTom03/Discord-Audio-Mirroring.git)
 ```
 
 ```bash
