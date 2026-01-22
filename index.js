@@ -29,7 +29,7 @@ async function establishBridge() {
         const guildA = await client.guilds.fetch(CONFIG.source.guildId);
         const guildB = await client.guilds.fetch(CONFIG.dest.guildId);
 
-        console.log(`[${new Date().toLocaleTimeString()}] 🔗 Connected: ${guildA.name} -> ${guildB.name}`);
+        console.log(`[${new Date().toLocaleTimeString()}] Connected: ${guildA.name} -> ${guildB.name}`);
 
         const connA = Voice.joinVoiceChannel({
             channelId: CONFIG.source.channelId,
@@ -51,7 +51,7 @@ async function establishBridge() {
             if (userId !== CONFIG.playerId) return;
             
             if (player.state.status !== Voice.AudioPlayerStatus.Playing) {
-                console.log("🎙️ Voice found.");
+                console.log("Voice found.");
                 
                 const opusStream = connA.receiver.subscribe(userId, {
                     end: { 
@@ -78,9 +78,6 @@ async function establishBridge() {
     }
 }
 
-/**
- * Schließt alle Verbindungen
- */
 function destroyBridge() {
     const connA = Voice.getVoiceConnection(CONFIG.source.guildId);
     const connB = Voice.getVoiceConnection(CONFIG.dest.guildId);
