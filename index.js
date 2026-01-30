@@ -1,18 +1,30 @@
-const Discord = require('discord.js');
+const { GatewayIntentBits, Client } = require('discord.js');
 const Voice = require('@discordjs/voice');
+const Dotenv = require('dotenv').config();
 
 /**
  * --- Configuration ---
  */
 const CONFIG = {
-    token: 'YOUR_BOT_TOKEN',
-    playerId: 'USER_ID_TO_MONITOR',
-    source: { guildId: 'SERVER_A_ID', channelId: 'CHANNEL_A_ID' },
-    dest: { guildId: 'SERVER_B_ID', channelId: 'CHANNEL_B_ID' }
+    agentKtoken: Dotenv.parsed.AGENT_K_TOKEN,
+    agentJtoken: Dotenv.parsed.AGENT_J_TOKEN,
+    playerId: Dotenv.parsed.PLAYER_ID,
+    source: {
+        guildId: Dotenv.parsed.SOURCE_GUILD_ID,
+        channelId: Dotenv.parsed.SOURCE_CHANNEL_ID
+    },
+    dest: {
+        guildId: Dotenv.parsed.DEST_GUILD_ID,
+        channelId: Dotenv.parsed.DEST_CHANNEL_ID
+    }
 };
 
-const client = new Discord.Client({
-    intents: [1, 128] 
+const clientK = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
+});
+
+const clientJ = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
 const player = Voice.createAudioPlayer({
@@ -22,28 +34,33 @@ const player = Voice.createAudioPlayer({
     }
 });
 
+let connA = null; // listener connection (agentK)
+let connB = null; // speaker connection (agentJ)
+
 async function establishBridge() {
-    if (Voice.getVoiceConnection(CONFIG.source.guildId)) return;
+    if (connA && connB) return;
 
     try {
-        const guildA = await client.guilds.fetch(CONFIG.source.guildId);
-        const guildB = await client.guilds.fetch(CONFIG.dest.guildId);
+        const guildA = await clientK.guilds.fetch(CONFIG.source.guildId);
+        const guildB = await clientJ.guilds.fetch(CONFIG.dest.guildId);
 
         console.log(`[${new Date().toLocaleTimeString()}] Connected: ${guildA.name} -> ${guildB.name}`);
 
-        const connA = Voice.joinVoiceChannel({
+        connA = Voice.joinVoiceChannel({
             channelId: CONFIG.source.channelId,
             guildId: guildA.id,
             adapterCreator: guildA.voiceAdapterCreator,
             selfDeaf: false,
             selfMute: true,
         });
-
-        const connB = Voice.joinVoiceChannel({
+        connB = Voice.joinVoiceChannel({
             channelId: CONFIG.dest.channelId,
             guildId: guildB.id,
             adapterCreator: guildB.voiceAdapterCreator,
         });
+
+        console.log(`connA: ${clientK.user.tag} joined guild=${guildA.id} channel=${CONFIG.source.channelId}`);
+        console.log(`connB: ${clientJ.user.tag} joined guild=${guildB.id} channel=${CONFIG.dest.channelId}`);
 
         connB.subscribe(player);
 
@@ -79,26 +96,30 @@ async function establishBridge() {
 }
 
 function destroyBridge() {
-    const connA = Voice.getVoiceConnection(CONFIG.source.guildId);
-    const connB = Voice.getVoiceConnection(CONFIG.dest.guildId);
-    
-    if (connA) connA.destroy();
-    if (connB) {
-        connB.setSpeaking(false);
-        connB.destroy();
+    if (connA) {
+        try { connA.destroy(); } catch (e) {}
+        connA = null;
     }
-    
+    if (connB) {
+        try { connB.setSpeaking(false); connB.destroy(); } catch (e) {}
+        connB = null;
+    }
+
     player.stop();
     console.log(`[${new Date().toLocaleTimeString()}] Bridge stopped.`);
 }
 
-client.once('ready', async () => {
-    console.log(`Bot logged in as ${client.user.tag}`);
+clientK.once('ready', async () => {
+    console.log(`AgentK logged in as ${clientK.user.tag}`);
     try {
-        const guildA = await client.guilds.fetch(CONFIG.source.guildId);
+        const guildA = await clientK.guilds.fetch(CONFIG.source.guildId);
         const member = await guildA.members.fetch(CONFIG.playerId).catch(() => null);
-        
+
         if (member && member.voice.channelId === CONFIG.source.channelId) {
+            if (!clientJ.user) {
+                console.log('AgentJ not ready yet — waiting for AgentJ to login...');
+                await new Promise(resolve => clientJ.once('ready', resolve));
+            }
             establishBridge();
         }
     } catch (e) {
@@ -106,9 +127,13 @@ client.once('ready', async () => {
     }
 });
 
-client.on('voiceStateUpdate', (oldState, newState) => {
+clientJ.once('ready', () => {
+    console.log(`AgentJ logged in as ${clientJ.user.tag}`);
+});
+
+clientK.on('voiceStateUpdate', (oldState, newState) => {
     if (newState.id !== CONFIG.playerId) return;
-    
+
     const isNowInSource = newState.channelId === CONFIG.source.channelId;
     const wasInSource = oldState.channelId === CONFIG.source.channelId;
 
@@ -119,7 +144,8 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
 });
 
-client.on('error', console.error);
+clientK.on('error', console.error);
+clientJ.on('error', console.error);
 
-
-client.login(CONFIG.token);
+clientK.login(CONFIG.agentKtoken);
+clientJ.login(CONFIG.agentJtoken);
