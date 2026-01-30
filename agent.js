@@ -107,6 +107,13 @@ let speakerPlaybackTimer = null;
 let speakerPlayingSource = null; // track which source we're playing
 // track last-seen sequence per source to avoid duplicates
 const speakerLastSeq = new Map();
+// Minimal AGC/normalization (frame-size proxy)
+let agcPeakAvg = 0;
+const AGC_ALPHA = Number(process.env.AGC_ALPHA || ARGS.agcAlpha || 0.12);
+const AGC_TARGET = Number(process.env.AGC_TARGET || ARGS.agcTarget || 120);
+const AGC_MIN = Number(process.env.AGC_MIN || ARGS.agcMin || 0.4);
+const AGC_MAX = Number(process.env.AGC_MAX || ARGS.agcMax || 2.0);
+let currentResource = null;
 
 // Helper: coalesce & send buffered frames for a listener info entry
 function flushCoalesce(info){
@@ -269,7 +276,10 @@ async function connectHub(){
         // reset last-seen seq for this source to avoid falsely deduping
         try{ if (speakerPlayingSource) speakerLastSeq.set(speakerPlayingSource, 0); }catch(e){}
         currentReadable = new Readable({ read(){} });
-        const resource = Voice.createAudioResource(currentReadable, { inputType: Voice.StreamType.Opus });
+        // request inlineVolume when available; not all stream types support it, so wrap safely
+        let resource = null;
+        try{ resource = Voice.createAudioResource(currentReadable, { inputType: Voice.StreamType.Opus, inlineVolume: true }); }catch(e){ resource = Voice.createAudioResource(currentReadable, { inputType: Voice.StreamType.Opus }); }
+        currentResource = resource;
         log('speaker', 'player.play invoked for', msg.userId);
         player.play(resource);
         if (!conn) log('speaker: no voice connection to play to');
@@ -349,7 +359,19 @@ async function connectHub(){
                   try{
                     if (!currentReadable) return;
                     const frame = speakerBuffer.shift();
-                    if (frame) currentReadable.push(frame);
+                    if (frame) {
+                      // update AGC proxy (moving avg of frame lengths)
+                      try{
+                        if (!agcPeakAvg) agcPeakAvg = frame.length;
+                        agcPeakAvg = AGC_ALPHA * frame.length + (1 - AGC_ALPHA) * agcPeakAvg;
+                        const desiredGain = AGC_TARGET / (agcPeakAvg || 1);
+                        const gain = Math.max(AGC_MIN, Math.min(AGC_MAX, desiredGain));
+                        if (currentResource && currentResource.volume && typeof currentResource.volume.setVolume === 'function'){
+                          try{ currentResource.volume.setVolume(gain); }catch(e){}
+                        }
+                      }catch(e){ }
+                      currentReadable.push(frame);
+                    }
                   }catch(e){ log('playback err', e && e.message); }
                 }, OPUS_FRAME_MS);
                 log('speaker jitter buffer started', { warmup: WARMUP_FRAMES, intervalMs: OPUS_FRAME_MS });
