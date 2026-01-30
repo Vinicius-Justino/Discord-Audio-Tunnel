@@ -91,6 +91,9 @@ let tunnelEnabled = false; // manual control: only forward audio when true
 let announceId = null;
 // pending queues for listener: key = `${source}:${userId}` where source is this listener's announceId
 const pendingQueues = new Map();
+let heartbeatTimer = null;
+let lastPong = 0;
+let statsTimer = null;
 // Speaker-side jitter buffer / playback smoothing
 const OPUS_FRAME_MS = Number(process.env.OPUS_FRAME_MS || ARGS.opusMs || 20);
 // Adjusted defaults: favor modest warmup, larger coalescing
@@ -167,9 +170,47 @@ async function connectHub(){
   ws = new WebSocket(HUB);
   ws.on('open', () => {
     log('ws open');
+    // reset announceId and some transient state on every open
     announceId = `${NAME}-${client.user.id}-${Date.now()}`;
     log('ws announce id', announceId);
-    ws.send(JSON.stringify({ type: 'announce', id: announceId, role: ROLE, clientId: client.user.id }));
+    // clear pending queues from any previous session to avoid stale references
+    try{ pendingQueues.clear(); }catch(e){}
+    try{ speakerLastSeq.clear(); }catch(e){}
+    try{ speakerBuffer = []; if (speakerPlaybackTimer){ clearInterval(speakerPlaybackTimer); speakerPlaybackTimer = null; } }catch(e){}
+    try{ ws.send(JSON.stringify({ type: 'announce', id: announceId, role: ROLE, clientId: client.user.id })); }catch(e){ log('ws send announce err', e && e.message); }
+    // heartbeat: track pong responses
+    lastPong = Date.now();
+    ws.on('pong', ()=>{ lastPong = Date.now(); });
+    // periodic stats logging
+    if (statsTimer) clearInterval(statsTimer);
+    statsTimer = setInterval(()=>{
+      try{
+        const age = Date.now() - lastPong;
+        log('stats', { pendingQueues: pendingQueues.size, speakerBuffer: speakerBuffer.length, seqEntries: speakerLastSeq.size, lastPongAgeMs: age, wsState: ws && ws.readyState });
+        // cleanup very-old pending queues (>120s)
+        const now = Date.now();
+        for (const [k,v] of pendingQueues.entries()){
+          if (v && v.startedAt && (now - v.startedAt) > 120000){
+            log('cleanup stale pendingQueue', { key: k });
+            try{ pendingQueues.delete(k); }catch(e){}
+          }
+        }
+      }catch(e){ log('stats err', e && e.message); }
+    }, 5000);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(()=>{
+      try{
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        // if no pong for >15s, consider connection dead and reconnect
+        const age = Date.now() - lastPong;
+        if (age > 15000){
+          log('heartbeat stale, force reconnect', { age });
+          try{ ws.terminate(); }catch(e){}
+          return;
+        }
+        ws.ping();
+      }catch(e){ log('heartbeat err', e && e.message); }
+    }, 5000);
   });
 
   ws.on('message', (data) => {
@@ -212,6 +253,8 @@ async function connectHub(){
             // ensure remaining coalesced frames are flushed, then send audio-end
             try{ flushCoalesce(info); }catch(e){ }
             try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({ type: 'audio-end', userId: msg.userId, source: msg.source })); } }catch(e){}
+            // cleanup pending queue entry
+            try{ pendingQueues.delete(key); }catch(e){}
           }
         }
         return;
@@ -223,6 +266,8 @@ async function connectHub(){
         speakerBuffer = [];
         if (speakerPlaybackTimer) { clearInterval(speakerPlaybackTimer); speakerPlaybackTimer = null; }
         speakerPlayingSource = msg.source || null;
+        // reset last-seen seq for this source to avoid falsely deduping
+        try{ if (speakerPlayingSource) speakerLastSeq.set(speakerPlayingSource, 0); }catch(e){}
         currentReadable = new Readable({ read(){} });
         const resource = Voice.createAudioResource(currentReadable, { inputType: Voice.StreamType.Opus });
         log('speaker', 'player.play invoked for', msg.userId);
@@ -249,6 +294,8 @@ async function connectHub(){
           currentReadable.push(null);
           currentReadable = null;
         }
+        // cleanup last seq for this source
+        try{ if (msg.source) speakerLastSeq.delete(msg.source); }catch(e){}
       }
     } else {
       // binary frame (Opus) - always log receipt so we can correlate with bridge forwards
@@ -314,8 +361,18 @@ async function connectHub(){
     }
   });
 
-  ws.on('close', () => { log('ws close - reconnecting in 1s'); setTimeout(connectHub, 1000); });
-  ws.on('error', (e)=> log('ws err', e && e.message));
+  ws.on('close', (code, reason) => {
+    log('ws close', { code, reason: reason && reason.toString ? reason.toString() : reason });
+    try{ if (heartbeatTimer) clearInterval(heartbeatTimer); heartbeatTimer = null; }catch(e){}
+    try{ if (statsTimer) clearInterval(statsTimer); statsTimer = null; }catch(e){}
+    // clear transient state so next open starts clean
+    try{ pendingQueues.clear(); }catch(e){}
+    try{ speakerLastSeq.clear(); }catch(e){}
+    try{ speakerBuffer = []; if (speakerPlaybackTimer){ clearInterval(speakerPlaybackTimer); speakerPlaybackTimer = null; } }catch(e){}
+    log('ws close - reconnecting in 1s');
+    setTimeout(connectHub, 1000);
+  });
+  ws.on('error', (e)=> { log('ws err', e && e.message); try{ if (heartbeatTimer) clearInterval(heartbeatTimer); heartbeatTimer = null; }catch(_){} try{ if (statsTimer) clearInterval(statsTimer); statsTimer = null; }catch(_){} });
 }
 
 // Helper: join the invoker's voice channel (via message command)
@@ -343,7 +400,7 @@ async function joinInvokerChannel(message) {
         log('detected speaking', userId, 'tunnelEnabled=', tunnelEnabled);
         if (!tunnelEnabled) return; // do nothing unless tunnel manually enabled
         const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1 };
+        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
         pendingQueues.set(key, info);
         const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
         // announce (include this listener's announceId as source so speaker can ACK)
@@ -376,6 +433,7 @@ async function joinInvokerChannel(message) {
           if (info.acked){
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
             else log('ws not open - audio-end', userId);
+            try{ pendingQueues.delete(key); }catch(e){}
           } else {
             // still send audio-end so hub/speakers can clean up when/if they get audio-start
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
@@ -414,7 +472,7 @@ async function autoJoinTo(guildId, channelId) {
         if (PLAYER_ID && userId !== PLAYER_ID) return;
         log('detected speaking', userId);
         const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1 };
+        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
         pendingQueues.set(key, info);
         const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
         if (ws && ws.readyState === WebSocket.OPEN){
@@ -441,6 +499,8 @@ async function autoJoinTo(guildId, channelId) {
           try{ flushCoalesce(info); }catch(e){}
           if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
           else { if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
+          // cleanup pending queue if ack already received
+          if (info.acked){ try{ pendingQueues.delete(key); }catch(e){} }
         });
       });
     }
