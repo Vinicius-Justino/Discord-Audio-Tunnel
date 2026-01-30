@@ -114,6 +114,8 @@ const AGC_TARGET = Number(process.env.AGC_TARGET || ARGS.agcTarget || 120);
 const AGC_MIN = Number(process.env.AGC_MIN || ARGS.agcMin || 0.4);
 const AGC_MAX = Number(process.env.AGC_MAX || ARGS.agcMax || 2.0);
 let currentResource = null;
+// Track currently-active sender (listener-side): key = `${announceId}:${userId}`
+let activeSenderKey = null;
 
 // Helper: coalesce & send buffered frames for a listener info entry
 function flushCoalesce(info){
@@ -143,6 +145,30 @@ function flushCoalesce(info){
 function ensureCoalesceTimer(info){
   if (info.coalesceTimer) return;
   info.coalesceTimer = setTimeout(()=>{ try{ flushCoalesce(info); }catch(e){ log('coalesce timer err', e && e.message); } }, COALESCE_MS);
+}
+
+// Activate next queued sender (FIFO by startedAt). Sends 'audio-start' for selected user.
+function activateNextSender(){
+  try{
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (activeSenderKey) return; // already active
+    let chosenKey = null;
+    let chosenInfo = null;
+    for (const [k,v] of pendingQueues.entries()){
+      if (!v) continue;
+      if (k === activeSenderKey) continue;
+      if (!chosenInfo || (v.startedAt && chosenInfo.startedAt && v.startedAt < chosenInfo.startedAt)){
+        chosenKey = k; chosenInfo = v;
+      }
+    }
+    if (chosenKey && chosenInfo){
+      activeSenderKey = chosenKey;
+      const userId = chosenInfo.userId || (chosenKey.split(':').pop());
+      log('activateNextSender', { key: chosenKey, userId });
+      // send audio-start for this source so speaker will ack and allow frames
+      ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
+    }
+  }catch(e){ log('activateNextSender err', e && e.message); }
 }
 
 function log(...a){ console.log(new Date().toISOString(), ...a); }
@@ -262,6 +288,8 @@ async function connectHub(){
             try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({ type: 'audio-end', userId: msg.userId, source: msg.source })); } }catch(e){}
             // cleanup pending queue entry
             try{ pendingQueues.delete(key); }catch(e){}
+            // if this was the active sender, clear and activate next
+            try{ if (activeSenderKey === key){ activeSenderKey = null; activateNextSender(); } }catch(e){ }
           }
         }
         return;
@@ -417,20 +445,26 @@ async function joinInvokerChannel(message) {
 
     // If listener, hook receiver and stream opus frames to hub
     if (ROLE === 'listener'){
-      conn.receiver.speaking.on('start', (userId)=>{
-        if (PLAYER_ID && userId !== PLAYER_ID) return;
-        log('detected speaking', userId, 'tunnelEnabled=', tunnelEnabled);
-        if (!tunnelEnabled) return; // do nothing unless tunnel manually enabled
-        const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
-        pendingQueues.set(key, info);
-        const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
-        // announce (include this listener's announceId as source so speaker can ACK)
-        if (ws && ws.readyState === WebSocket.OPEN){
-          log('ws send', 'audio-start', userId, 'source=', announceId);
-          ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
+      conn.receiver.speaking.on('start', async (userId)=>{
+          const u = client.users.cache.get(userId) || await client.users.fetch(userId).catch(()=>null);
+          if (u && u.bot){ log('ignoring bot user', userId); return; }
+          log('detected speaking', userId, 'tunnelEnabled=', tunnelEnabled);
+          if (!tunnelEnabled) return; // do nothing unless tunnel manually enabled
+          const key = `${announceId}:${userId}`;
+          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
+          pendingQueues.set(key, info);
+          const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
+        // announce only if nobody else is active; otherwise remain queued
+        if (!activeSenderKey){
+          activeSenderKey = key;
+          if (ws && ws.readyState === WebSocket.OPEN){
+            log('ws send', 'audio-start', userId, 'source=', announceId);
+            ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
+          } else {
+            log('ws not open - cannot send audio-start', userId);
+          }
         } else {
-          log('ws not open - cannot send audio-start', userId);
+          log('queued sender (waiting)', { key });
         }
         opusStream.on('data', (chunk)=>{
           try{
@@ -461,6 +495,13 @@ async function joinInvokerChannel(message) {
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
             else log('ws not open - audio-end', userId);
           }
+          // if this was the active sender, clear and activate next
+          try{
+            if (activeSenderKey === key){
+              activeSenderKey = null;
+              activateNextSender();
+            }
+          }catch(e){ log('end-handler activateNext err', e && e.message); }
         });
       });
     }
@@ -490,40 +531,46 @@ async function autoJoinTo(guildId, channelId) {
     log('auto-joined', guildId, channelId);
 
     if (ROLE === 'listener'){
-      conn.receiver.speaking.on('start', (userId)=>{
-        if (PLAYER_ID && userId !== PLAYER_ID) return;
-        log('detected speaking', userId);
-        const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
-        pendingQueues.set(key, info);
-        const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
-        if (ws && ws.readyState === WebSocket.OPEN){
-          log('ws send', 'audio-start', userId, 'source=', announceId);
-          ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
-        } else {
-          log('ws not open - cannot send audio-start', userId);
-        }
-        opusStream.on('data', (chunk)=>{
-          try{
-            if (!info.acked){
-              if (info.queue.length < 1000) info.queue.push(chunk);
-              else log('pending queue full - dropping chunk', key);
+      conn.receiver.speaking.on('start', async (userId)=>{
+          const u = client.users.cache.get(userId) || await client.users.fetch(userId).catch(()=>null);
+          if (u && u.bot){ log('ignoring bot user', userId); return; }
+          log('detected speaking', userId);
+          const key = `${announceId}:${userId}`;
+          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
+          pendingQueues.set(key, info);
+          const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
+          // immediately activate if no active sender, otherwise queue
+          if (!activeSenderKey){
+            activeSenderKey = key;
+            if (ws && ws.readyState === WebSocket.OPEN){
+              log('ws send', 'audio-start', userId, 'source=', announceId);
+              ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
             } else {
-              if (!info.coalesceBuffer) info.coalesceBuffer = [];
-              info.coalesceBuffer.push(chunk);
-              if (info.coalesceBuffer.length >= COALESCE_FRAMES) { flushCoalesce(info); }
-              else { ensureCoalesceTimer(info); }
+              log('ws not open - cannot send audio-start', userId);
             }
-          }catch(e){ log('ws send chunk err', e && e.message); }
-        });
-        opusStream.on('end', ()=>{
-          info.ended = true;
-          try{ flushCoalesce(info); }catch(e){}
-          if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
-          else { if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
-          // cleanup pending queue if ack already received
-          if (info.acked){ try{ pendingQueues.delete(key); }catch(e){} }
-        });
+          } else {
+            log('queued sender (waiting)', { key });
+          }
+          opusStream.on('data', (chunk)=>{
+            try{
+              if (!info.acked){
+                if (info.queue.length < 1000) info.queue.push(chunk);
+                else log('pending queue full - dropping chunk', key);
+              } else {
+                if (!info.coalesceBuffer) info.coalesceBuffer = [];
+                info.coalesceBuffer.push(chunk);
+                if (info.coalesceBuffer.length >= COALESCE_FRAMES) { flushCoalesce(info); }
+                else { ensureCoalesceTimer(info); }
+              }
+            }catch(e){ log('ws send chunk err', e && e.message); }
+          });
+          opusStream.on('end', ()=>{
+            info.ended = true;
+            try{ flushCoalesce(info); }catch(e){}
+            if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); try{ pendingQueues.delete(key); }catch(e){} }
+            else { if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
+            if (activeSenderKey === key){ activeSenderKey = null; activateNextSender(); }
+          });
       });
     }
 
