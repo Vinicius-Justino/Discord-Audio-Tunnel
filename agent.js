@@ -91,6 +91,49 @@ let tunnelEnabled = false; // manual control: only forward audio when true
 let announceId = null;
 // pending queues for listener: key = `${source}:${userId}` where source is this listener's announceId
 const pendingQueues = new Map();
+// Speaker-side jitter buffer / playback smoothing
+const OPUS_FRAME_MS = Number(process.env.OPUS_FRAME_MS || ARGS.opusMs || 20);
+// Adjusted defaults: favor modest warmup, larger coalescing
+const WARMUP_FRAMES = Number(process.env.WARMUP_FRAMES || ARGS.warmup || 6);
+const MAX_SPEAKER_BUFFER = Number(process.env.MAX_SPEAKER_BUFFER || ARGS.maxBuf || 5000);
+// Coalescing (listener-side): send N Opus frames together or after a timeout
+const COALESCE_FRAMES = Number(process.env.COALESCE_FRAMES || ARGS.coalesceFrames || 6);
+const COALESCE_MS = Number(process.env.COALESCE_MS || ARGS.coalesceMs || (OPUS_FRAME_MS * COALESCE_FRAMES));
+let speakerBuffer = [];
+let speakerPlaybackTimer = null;
+let speakerPlayingSource = null; // track which source we're playing
+// track last-seen sequence per source to avoid duplicates
+const speakerLastSeq = new Map();
+
+// Helper: coalesce & send buffered frames for a listener info entry
+function flushCoalesce(info){
+  try{
+    if (!info || !info.coalesceBuffer || !info.coalesceBuffer.length) return;
+    if (!(ws && ws.readyState === WebSocket.OPEN)) return;
+    // pack each frame with a 4-byte seq + 2-byte big-endian length prefix so the speaker can split and dedupe
+    const parts = [];
+    for (const b of info.coalesceBuffer){
+      const seq = info.seq || 1;
+      const seqBuf = Buffer.allocUnsafe(4);
+      seqBuf.writeUInt32BE(seq, 0);
+      const lenBuf = Buffer.allocUnsafe(2);
+      lenBuf.writeUInt16BE(b.length, 0);
+      parts.push(seqBuf);
+      parts.push(lenBuf);
+      parts.push(b);
+      info.seq = seq + 1;
+    }
+    const out = Buffer.concat(parts);
+    ws.send(out);
+    info.coalesceBuffer.length = 0;
+    if (info.coalesceTimer){ clearTimeout(info.coalesceTimer); info.coalesceTimer = null; }
+  }catch(e){ log('flushCoalesce err', e && e.message); }
+}
+
+function ensureCoalesceTimer(info){
+  if (info.coalesceTimer) return;
+  info.coalesceTimer = setTimeout(()=>{ try{ flushCoalesce(info); }catch(e){ log('coalesce timer err', e && e.message); } }, COALESCE_MS);
+}
 
 function log(...a){ console.log(new Date().toISOString(), ...a); }
 
@@ -154,20 +197,32 @@ async function connectHub(){
         const key = `${msg.source}:${msg.userId}`;
         const info = pendingQueues.get(key);
         if (info){
-          log('ws recv', 'audio-ack', key, 'flushing', info.queue.length);
-          // flush queued chunks
-          for (const chunk of info.queue){
-            try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(chunk); } }catch(e){ log('ws send chunk err', e && e.message); }
-          }
+          log('ws recv', 'audio-ack', key, 'flushing queued count', info.queue.length);
+          // move queued chunks into coalesce buffer and start coalesce timer / flush
+          if (!info.coalesceBuffer) info.coalesceBuffer = [];
+          while (info.queue && info.queue.length){ info.coalesceBuffer.push(info.queue.shift()); }
           info.acked = true;
-          // if stream already ended, send audio-end
-          if (info.ended){ try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({ type: 'audio-end', userId: msg.userId, source: msg.source })); } }catch(e){} }
+          if (info.coalesceBuffer.length) {
+            // if we have enough frames, send immediately, otherwise schedule flush
+            if (info.coalesceBuffer.length >= COALESCE_FRAMES) flushCoalesce(info);
+            else ensureCoalesceTimer(info);
+          }
+          // if stream already ended, send audio-end after flush
+          if (info.ended){
+            // ensure remaining coalesced frames are flushed, then send audio-end
+            try{ flushCoalesce(info); }catch(e){ }
+            try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({ type: 'audio-end', userId: msg.userId, source: msg.source })); } }catch(e){}
+          }
         }
         return;
       }
       if (msg.type === 'audio-start'){
         log('audio-start', msg.userId);
         log('speaker', 'creating readable resource for', msg.userId);
+        // reset and prepare jitter buffer state for this incoming source
+        speakerBuffer = [];
+        if (speakerPlaybackTimer) { clearInterval(speakerPlaybackTimer); speakerPlaybackTimer = null; }
+        speakerPlayingSource = msg.source || null;
         currentReadable = new Readable({ read(){} });
         const resource = Voice.createAudioResource(currentReadable, { inputType: Voice.StreamType.Opus });
         log('speaker', 'player.play invoked for', msg.userId);
@@ -184,7 +239,16 @@ async function connectHub(){
         }catch(e){ log('ws ack err', e && e.message); }
       } else if (msg.type === 'audio-end'){
         log('audio-end', msg.userId);
-        if (currentReadable){ currentReadable.push(null); currentReadable = null; }
+        // stop playback timer and close readable after flushing buffer
+        if (speakerPlaybackTimer) { clearInterval(speakerPlaybackTimer); speakerPlaybackTimer = null; }
+        if (currentReadable){
+          // flush remaining buffered frames
+          try{
+            while (speakerBuffer && speakerBuffer.length){ currentReadable.push(speakerBuffer.shift()); }
+          }catch(e){ log('flush err', e && e.message); }
+          currentReadable.push(null);
+          currentReadable = null;
+        }
       }
     } else {
       // binary frame (Opus) - always log receipt so we can correlate with bridge forwards
@@ -192,11 +256,58 @@ async function connectHub(){
         const len = data && data.length ? data.length : null;
         log('ws binary rx', { len, role: ROLE, announceId, hasReadable: !!currentReadable });
         if (ROLE === 'speaker'){
-          if (currentReadable){
-            log('ws recv', 'chunk', len);
-            currentReadable.push(data);
-          } else {
+          if (!currentReadable){
+            // no target to play into: drop but log
             log('ws recv chunk dropped - no readable', len);
+          } else {
+            // incoming data may contain multiple length-prefixed frames; parse them
+              try{
+              const buf = Buffer.from(data);
+              let offset = 0;
+              let pushedAny = false;
+              while (offset < buf.length){
+                // expect 4-byte seq + 2-byte length header
+                if (offset + 6 <= buf.length){
+                  const seq = buf.readUInt32BE(offset);
+                  const fragLen = buf.readUInt16BE(offset + 4);
+                  if (fragLen > 0 && offset + 6 + fragLen <= buf.length){
+                    const frame = buf.slice(offset + 6, offset + 6 + fragLen);
+                    // dedupe by sequence for the current playing source
+                    const src = speakerPlayingSource || 'unknown';
+                    const last = speakerLastSeq.get(src) || 0;
+                    if (seq <= last){
+                      log('duplicate frame detected', { src, seq, last });
+                    } else {
+                      speakerLastSeq.set(src, seq);
+                      if (speakerBuffer.length < MAX_SPEAKER_BUFFER) speakerBuffer.push(frame);
+                      else { speakerBuffer.shift(); speakerBuffer.push(frame); log('speaker buffer overflow - dropping oldest frame'); }
+                    }
+                    offset += 6 + fragLen;
+                    pushedAny = true;
+                    continue;
+                  }
+                }
+                // fallback: remainder is a single frame (no header)
+                const remainder = buf.slice(offset);
+                if (remainder.length){
+                  if (speakerBuffer.length < MAX_SPEAKER_BUFFER) speakerBuffer.push(remainder);
+                  else { speakerBuffer.shift(); speakerBuffer.push(remainder); log('speaker buffer overflow - dropping oldest frame'); }
+                  pushedAny = true;
+                }
+                break;
+              }
+              // if we have enough frames buffered and playback not started, start timer
+              if (!speakerPlaybackTimer && speakerBuffer.length >= WARMUP_FRAMES){
+                speakerPlaybackTimer = setInterval(()=>{
+                  try{
+                    if (!currentReadable) return;
+                    const frame = speakerBuffer.shift();
+                    if (frame) currentReadable.push(frame);
+                  }catch(e){ log('playback err', e && e.message); }
+                }, OPUS_FRAME_MS);
+                log('speaker jitter buffer started', { warmup: WARMUP_FRAMES, intervalMs: OPUS_FRAME_MS });
+              }
+            }catch(e){ log('ws recv parse err', e && e.message); }
           }
         }
       }catch(e){ log('ws recv err', e && e.message); }
@@ -232,7 +343,7 @@ async function joinInvokerChannel(message) {
         log('detected speaking', userId, 'tunnelEnabled=', tunnelEnabled);
         if (!tunnelEnabled) return; // do nothing unless tunnel manually enabled
         const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false };
+        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1 };
         pendingQueues.set(key, info);
         const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
         // announce (include this listener's announceId as source so speaker can ACK)
@@ -249,17 +360,19 @@ async function joinInvokerChannel(message) {
               if (info.queue.length < 1000) info.queue.push(chunk);
               else log('pending queue full - dropping chunk', key);
             } else {
-              if (ws && ws.readyState === WebSocket.OPEN){
-                log('ws send', 'chunk', chunk.length);
-                ws.send(chunk);
-              } else {
-                log('ws not open - drop chunk', chunk.length);
-              }
+              // coalesce frames before sending to reduce small-packet overhead
+              if (!info.coalesceBuffer) info.coalesceBuffer = [];
+              info.coalesceBuffer.push(chunk);
+              // if we have enough frames, flush immediately
+              if (info.coalesceBuffer.length >= COALESCE_FRAMES) { flushCoalesce(info); }
+              else { ensureCoalesceTimer(info); }
             }
           }catch(e){ log('ws send chunk err', e && e.message); }
         });
         opusStream.on('end', ()=>{
           info.ended = true;
+          // flush coalesced frames if any
+          try{ flushCoalesce(info); }catch(e){}
           if (info.acked){
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
             else log('ws not open - audio-end', userId);
@@ -301,7 +414,7 @@ async function autoJoinTo(guildId, channelId) {
         if (PLAYER_ID && userId !== PLAYER_ID) return;
         log('detected speaking', userId);
         const key = `${announceId}:${userId}`;
-        const info = { queue: [], acked: false, ended: false };
+        const info = { queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1 };
         pendingQueues.set(key, info);
         const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
         if (ws && ws.readyState === WebSocket.OPEN){
@@ -316,13 +429,16 @@ async function autoJoinTo(guildId, channelId) {
               if (info.queue.length < 1000) info.queue.push(chunk);
               else log('pending queue full - dropping chunk', key);
             } else {
-              if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'chunk', chunk.length); ws.send(chunk); }
-              else log('ws not open - drop chunk', chunk.length);
+              if (!info.coalesceBuffer) info.coalesceBuffer = [];
+              info.coalesceBuffer.push(chunk);
+              if (info.coalesceBuffer.length >= COALESCE_FRAMES) { flushCoalesce(info); }
+              else { ensureCoalesceTimer(info); }
             }
           }catch(e){ log('ws send chunk err', e && e.message); }
         });
         opusStream.on('end', ()=>{
           info.ended = true;
+          try{ flushCoalesce(info); }catch(e){}
           if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
           else { if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
         });
