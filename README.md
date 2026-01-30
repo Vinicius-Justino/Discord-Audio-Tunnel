@@ -79,3 +79,48 @@ pm2 save
 ## Disclaimer
 
 I take no responsibility for your use of this software. This bot is a proof-of-concept for educational purposes. Users are responsible for ensuring their use of the bot complies with the Discord Terms of Service (ToS). I am not liable for any data loss, server bans, or other issues resulting from the deployment of this code.
+
+---
+
+## Split-run (recommended)
+
+If you run two bots in the same Node process, `@discordjs/voice` will reuse the same voice connection per guild. To avoid that, run one bot per process and relay audio between them using a local WebSocket hub.
+
+1) Install deps (in project root):
+
+```bash
+npm install
+npm install ws
+```
+
+2) Start the bridge hub (on the same host):
+
+```bash
+node bridge.js
+# or run under pm2
+pm2 start bridge.js --name bridge
+```
+
+pm2 start agent.js --name agentJ --update-env --env AGENT_TOKEN=<TOKEN_J> --env AGENT_NAME=agentJ --env AGENT_ROLE=speaker
+3) Start two agents (example using pm2) — you can pass role/name/token as CLI flags instead of setting env vars:
+
+```bash
+# listener (agentK)
+pm2 start agent.js --name agentK -- --token <TOKEN_K> --name agentK --role listener --player-id <PLAYER_ID>
+
+# speaker (agentJ)
+pm2 start agent.js --name agentJ -- --token <TOKEN_J> --name agentJ --role speaker
+```
+
+Optional: pass `--hub ws://host:port` to change the bridge URL, or `--autojoin guildId:channelId` to have the agent automatically join a voice channel on startup.
+
+4) Use text commands in Discord (in server channel):
+
+- `!agentK join` — agentK joins your current voice call as listener
+- `!agentJ join` — agentJ joins your current voice call as speaker
+- `!agentK leave` / `!agentJ leave` — make them leave
+- `!agentK channel` / `!agentJ channel` — report their voice channel
+
+Notes:
+- The hub binds to `ws://0.0.0.0:8080` by default. If running on the same machine use `HUB_URL=ws://127.0.0.1:8080` in env.
+- Keep the hub accessible only locally or protect it with a simple token if you expose it.

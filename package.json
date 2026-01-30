@@ -6,6 +6,7 @@
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.3",
     "libsodium-wrappers": "^0.8.2",
-    "opusscript": "^0.0.8"
+    "opusscript": "^0.0.8",
+    "ws": "^8.19.0"
   }
 }
