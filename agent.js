@@ -1,19 +1,20 @@
 /*
  agent.js - single-client runner for AgentK/AgentJ
- Usage example (listener):
- AGENT_TOKEN=xxx AGENT_NAME=agentK AGENT_ROLE=listener PLAYER_ID=12345 HUB_URL=ws://localhost:8080 node agent.js
-
- Usage example (speaker):
- AGENT_TOKEN=yyy AGENT_NAME=agentJ AGENT_ROLE=speaker HUB_URL=ws://localhost:8080 node agent.js
+ Usage:
+   Listener: AGENT_TOKEN=xxx AGENT_NAME=agentK AGENT_ROLE=listener HUB_URL=ws://... node agent.js
+   Speaker : AGENT_TOKEN=yyy AGENT_NAME=agentJ AGENT_ROLE=speaker HUB_URL=ws://... node agent.js
+ This process can act as a listener (captures Opus from Discord and forwards to hub)
+ or as a speaker (receives Opus from hub and plays into a Discord voice channel).
 */
 
 const { GatewayIntentBits, Client } = require('discord.js');
 const Voice = require('@discordjs/voice');
 const WebSocket = require('ws');
 const { Readable } = require('stream');
+const { EventEmitter } = require('events');
 const Dotenv = require('dotenv').config();
 
-// Simple CLI args parser: --token, --name, --role, --hub, --player-id, --autojoin=guildId:channelId
+// Parse CLI args: supports `--key=value` and `--flag value` forms
 function parseArgs() {
   const out = {};
   for (let i = 2; i < process.argv.length; i++) {
@@ -89,19 +90,23 @@ let ws = null;
 let currentReadable = null;
 let tunnelEnabled = false; // manual control: only forward audio when true
 let announceId = null;
-// pending queues for listener: key = `${source}:${userId}` where source is this listener's announceId
+// Pending per-user queues (listener role). Key format: `${source}:${userId}`
 const pendingQueues = new Map();
 let heartbeatTimer = null;
 let lastPong = 0;
 let statsTimer = null;
+let queueMonitorTimer = null;
+const queueSignals = new EventEmitter();
 // Speaker-side jitter buffer / playback smoothing
 const OPUS_FRAME_MS = Number(process.env.OPUS_FRAME_MS || ARGS.opusMs || 20);
 // Adjusted defaults: favor modest warmup, larger coalescing
 const WARMUP_FRAMES = Number(process.env.WARMUP_FRAMES || ARGS.warmup || 6);
-const MAX_SPEAKER_BUFFER = Number(process.env.MAX_SPEAKER_BUFFER || ARGS.maxBuf || 5000);
 // Coalescing (listener-side): send N Opus frames together or after a timeout
 const COALESCE_FRAMES = Number(process.env.COALESCE_FRAMES || ARGS.coalesceFrames || 6);
 const COALESCE_MS = Number(process.env.COALESCE_MS || ARGS.coalesceMs || (OPUS_FRAME_MS * COALESCE_FRAMES));
+// Silence handling: how long to wait for first frame (pending->idle) and how long to keep idle queues
+const FIRST_FRAME_WAIT_MS = Number(process.env.FIRST_FRAME_WAIT_MS || ARGS.firstFrameWait || 1000);
+const QUEUE_LIFE_MS = Number(process.env.QUEUE_LIFE_MS || ARGS.queueLife || 10000);
 let speakerBuffer = [];
 let speakerPlaybackTimer = null;
 let speakerPlayingSource = null; // track which source we're playing
@@ -157,9 +162,17 @@ function activateNextSender(){
     for (const [k,v] of pendingQueues.entries()){
       if (!v) continue;
       if (k === activeSenderKey) continue;
-      if (!chosenInfo || (v.startedAt && chosenInfo.startedAt && v.startedAt < chosenInfo.startedAt)){
-        chosenKey = k; chosenInfo = v;
-      }
+      // skip closed entries
+      if (v.state === 'closed') continue;
+      // skip paused entries that have no buffered frames
+      const hasFrames = (v.queue && v.queue.length) || (v.coalesceBuffer && v.coalesceBuffer.length);
+      if (v.state === 'paused' && !hasFrames) continue;
+      if (v.ended && !hasFrames) continue;
+      // prefer currently-buffering entries (they have live audio)
+      if (!chosenInfo){ chosenKey = k; chosenInfo = v; continue; }
+      if (chosenInfo.state !== 'buffering' && v.state === 'buffering'){ chosenKey = k; chosenInfo = v; continue; }
+      // otherwise FIFO by startedAt
+      if (v.startedAt && chosenInfo.startedAt && v.startedAt < chosenInfo.startedAt){ chosenKey = k; chosenInfo = v; }
     }
     if (chosenKey && chosenInfo){
       activeSenderKey = chosenKey;
@@ -172,6 +185,65 @@ function activateNextSender(){
 }
 
 function log(...a){ console.log(new Date().toISOString(), ...a); }
+
+function cleanupPendingQueue(key){
+  try{
+    const info = pendingQueues.get(key);
+    if (!info) return;
+    // clear timers
+    try{ if (info.coalesceTimer) clearTimeout(info.coalesceTimer); info.coalesceTimer = null; }catch(e){}
+    try{ if (info.firstFrameTimer) clearTimeout(info.firstFrameTimer); info.firstFrameTimer = null; }catch(e){}
+    try{ if (info.expireTimer) clearTimeout(info.expireTimer); info.expireTimer = null; }catch(e){}
+    // clear buffers so paused entry doesn't hold memory
+    try{ if (info.queue && info.queue.length){ info.queue.length = 0; } }catch(e){}
+    try{ if (info.coalesceBuffer && info.coalesceBuffer.length){ info.coalesceBuffer.length = 0; } }catch(e){}
+    // mark paused (no definitive deletion)
+    info.state = 'paused';
+    info.cleanedAt = Date.now();
+    log('cleanupPendingQueue -> paused (buffers cleared)', { key });
+  }catch(e){ log('cleanupPendingQueue err', e && e.message); }
+}
+
+// Pause a pending queue instead of deleting it immediately.
+// Keeps buffered frames and metadata so the queue can resume automatically if the user speaks again.
+function pausePendingQueue(key){
+  try{
+    const info = pendingQueues.get(key);
+    if (!info) return;
+    // clear timers but keep buffers (queue/coalesceBuffer) so we can resume
+    try{ if (info.coalesceTimer) clearTimeout(info.coalesceTimer); info.coalesceTimer = null; }catch(e){}
+    try{ if (info.firstFrameTimer) clearTimeout(info.firstFrameTimer); info.firstFrameTimer = null; }catch(e){}
+    try{ if (info.expireTimer) clearTimeout(info.expireTimer); info.expireTimer = null; }catch(e){}
+    info.state = 'paused';
+    info.pausedAt = Date.now();
+    log('paused pendingQueue', { key });
+    // if this was the active sender, relinquish and activate next immediately
+    try{
+      if (activeSenderKey === key){
+        activeSenderKey = null;
+        setImmediate(()=>{ try{ activateNextSender(); }catch(e){ log('activateNext after pause err', e && e.message); } });
+      }
+    }catch(e){ }
+  }catch(e){ log('pausePendingQueue err', e && e.message); }
+}
+
+
+// Signals handlers: respond to monitor-emitted signals
+queueSignals.on('pendingTimeout', (key)=>{
+  try{
+    const info = pendingQueues.get(key);
+    if (!info) return;
+    if (info.state === 'pending'){
+      info.state = 'idle';
+      info.idleSince = Date.now();
+      log('signal: pendingTimeout -> idle', { key });
+    }
+  }catch(e){ log('pendingTimeout handler err', e && e.message); }
+});
+
+queueSignals.on('idleExpire', (key)=>{
+  try{ pausePendingQueue(key); }catch(e){ log('idleExpire handler err', e && e.message); }
+});
 
 async function safeSend(channel, text) {
   try {
@@ -214,6 +286,23 @@ async function connectHub(){
     // heartbeat: track pong responses
     lastPong = Date.now();
     ws.on('pong', ()=>{ lastPong = Date.now(); });
+    // start central queue monitor (emits signals rather than per-queue timers)
+    try{ if (queueMonitorTimer) clearInterval(queueMonitorTimer); }catch(e){}
+    queueMonitorTimer = setInterval(()=>{
+      try{
+        const now = Date.now();
+        for (const [k,v] of pendingQueues.entries()){
+          if (!v) continue;
+          // pending -> idle after FIRST_FRAME_WAIT_MS
+          if (v.state === 'pending'){
+            const age = now - (v.startedAt || 0);
+            if (age >= FIRST_FRAME_WAIT_MS){ queueSignals.emit('pendingTimeout', k); }
+          }
+          // idle -> pause after QUEUE_LIFE_MS
+          if (v.state === 'idle' && v.idleSince){ const idleAge = now - v.idleSince; if (idleAge >= QUEUE_LIFE_MS) queueSignals.emit('idleExpire', k); }
+        }
+      }catch(e){ log('queueMonitor err', e && e.message); }
+    }, Math.max(50, Math.min(200, Math.floor(FIRST_FRAME_WAIT_MS/4))));
     // periodic stats logging
     if (statsTimer) clearInterval(statsTimer);
     statsTimer = setInterval(()=>{
@@ -224,8 +313,8 @@ async function connectHub(){
         const now = Date.now();
         for (const [k,v] of pendingQueues.entries()){
           if (v && v.startedAt && (now - v.startedAt) > 120000){
-            log('cleanup stale pendingQueue', { key: k });
-            try{ pendingQueues.delete(k); }catch(e){}
+            log('cleanup stale pendingQueue -> pause', { key: k });
+            try{ pausePendingQueue(k); }catch(e){}
           }
         }
       }catch(e){ log('stats err', e && e.message); }
@@ -287,7 +376,7 @@ async function connectHub(){
             try{ flushCoalesce(info); }catch(e){ }
             try{ if (ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({ type: 'audio-end', userId: msg.userId, source: msg.source })); } }catch(e){}
             // cleanup pending queue entry
-            try{ pendingQueues.delete(key); }catch(e){}
+            try{ pausePendingQueue(key); }catch(e){}
             // if this was the active sender, clear and activate next
             try{ if (activeSenderKey === key){ activeSenderKey = null; activateNextSender(); } }catch(e){ }
           }
@@ -364,8 +453,8 @@ async function connectHub(){
                       log('duplicate frame detected', { src, seq, last });
                     } else {
                       speakerLastSeq.set(src, seq);
-                      if (speakerBuffer.length < MAX_SPEAKER_BUFFER) speakerBuffer.push(frame);
-                      else { speakerBuffer.shift(); speakerBuffer.push(frame); log('speaker buffer overflow - dropping oldest frame'); }
+                      // preserve all incoming frames (no enforced cap)
+                      speakerBuffer.push(frame);
                     }
                     offset += 6 + fragLen;
                     pushedAny = true;
@@ -375,8 +464,8 @@ async function connectHub(){
                 // fallback: remainder is a single frame (no header)
                 const remainder = buf.slice(offset);
                 if (remainder.length){
-                  if (speakerBuffer.length < MAX_SPEAKER_BUFFER) speakerBuffer.push(remainder);
-                  else { speakerBuffer.shift(); speakerBuffer.push(remainder); log('speaker buffer overflow - dropping oldest frame'); }
+                  // preserve remainder frame
+                  speakerBuffer.push(remainder);
                   pushedAny = true;
                 }
                 break;
@@ -415,6 +504,7 @@ async function connectHub(){
     log('ws close', { code, reason: reason && reason.toString ? reason.toString() : reason });
     try{ if (heartbeatTimer) clearInterval(heartbeatTimer); heartbeatTimer = null; }catch(e){}
     try{ if (statsTimer) clearInterval(statsTimer); statsTimer = null; }catch(e){}
+    try{ if (queueMonitorTimer) clearInterval(queueMonitorTimer); queueMonitorTimer = null; }catch(e){}
     // clear transient state so next open starts clean
     try{ pendingQueues.clear(); }catch(e){}
     try{ speakerLastSeq.clear(); }catch(e){}
@@ -451,27 +541,32 @@ async function joinInvokerChannel(message) {
           log('detected speaking', userId, 'tunnelEnabled=', tunnelEnabled);
           if (!tunnelEnabled) return; // do nothing unless tunnel manually enabled
           const key = `${announceId}:${userId}`;
-          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
+          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now(), state: 'pending', firstFrameTimer: null, expireTimer: null, lastDataAt: null };
           pendingQueues.set(key, info);
           const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
-        // announce only if nobody else is active; otherwise remain queued
-        if (!activeSenderKey){
-          activeSenderKey = key;
-          if (ws && ws.readyState === WebSocket.OPEN){
-            log('ws send', 'audio-start', userId, 'source=', announceId);
-            ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
-          } else {
-            log('ws not open - cannot send audio-start', userId);
-          }
-        } else {
-          log('queued sender (waiting)', { key });
-        }
+          // wait for first frame before announcing; set a short timer that will mark it idle
+          // Rely on central monitor to emit a 'pendingTimeout' signal after FIRST_FRAME_WAIT_MS
+          // keep the creation timestamp so the monitor can decide
+          info.startedAt = info.startedAt || Date.now();
+          // no per-queue timers here
+          // announce only when buffering (we'll let activateNextSender pick it)
+          log('queued sender (pending)', { key });
         opusStream.on('data', (chunk)=>{
           try{
+            // on first data, mark buffering and cancel pending timers
+            if (info.state !== 'buffering'){
+              // transition to buffering on first real frame; clear any idle markers
+              info.state = 'buffering';
+              info.lastDataAt = Date.now();
+              info.idleSince = null;
+              info.pausedAt = null;
+              log('queue buffering', { key });
+              // try to activate immediately if no active sender
+              try{ activateNextSender(); }catch(e){}
+            }
             if (!info.acked){
-              // buffer until ACK from speaker
-              if (info.queue.length < 1000) info.queue.push(chunk);
-              else log('pending queue full - dropping chunk', key);
+              // buffer until ACK from speaker (no hard limit)
+              info.queue.push(chunk);
             } else {
               // coalesce frames before sending to reduce small-packet overhead
               if (!info.coalesceBuffer) info.coalesceBuffer = [];
@@ -486,10 +581,10 @@ async function joinInvokerChannel(message) {
           info.ended = true;
           // flush coalesced frames if any
           try{ flushCoalesce(info); }catch(e){}
-          if (info.acked){
+            if (info.acked){
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
             else log('ws not open - audio-end', userId);
-            try{ pendingQueues.delete(key); }catch(e){}
+            try{ pausePendingQueue(key); }catch(e){}
           } else {
             // still send audio-end so hub/speakers can clean up when/if they get audio-start
             if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); }
@@ -536,26 +631,26 @@ async function autoJoinTo(guildId, channelId) {
           if (u && u.bot){ log('ignoring bot user', userId); return; }
           log('detected speaking', userId);
           const key = `${announceId}:${userId}`;
-          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now() };
+          const info = { userId, queue: [], acked: false, ended: false, coalesceBuffer: [], coalesceTimer: null, seq: 1, startedAt: Date.now(), state: 'pending', firstFrameTimer: null, expireTimer: null, lastDataAt: null };
           pendingQueues.set(key, info);
           const opusStream = conn.receiver.subscribe(userId, { end: { behavior: Voice.EndBehaviorType.AfterSilence, duration: 2000 } });
-          // immediately activate if no active sender, otherwise queue
-          if (!activeSenderKey){
-            activeSenderKey = key;
-            if (ws && ws.readyState === WebSocket.OPEN){
-              log('ws send', 'audio-start', userId, 'source=', announceId);
-              ws.send(JSON.stringify({ type: 'audio-start', userId, source: announceId }));
-            } else {
-              log('ws not open - cannot send audio-start', userId);
-            }
-          } else {
-            log('queued sender (waiting)', { key });
-          }
+          // wait for first frame before announcing; set a short timer that will mark it idle
+          // Rely on central monitor to emit a 'pendingTimeout' signal after FIRST_FRAME_WAIT_MS
+          info.startedAt = info.startedAt || Date.now();
+          log('queued sender (pending)', { key });
           opusStream.on('data', (chunk)=>{
             try{
+              if (info.state !== 'buffering'){
+                info.state = 'buffering';
+                info.lastDataAt = Date.now();
+                try{ if (info.firstFrameTimer) clearTimeout(info.firstFrameTimer); }catch(e){}
+                try{ if (info.expireTimer) clearTimeout(info.expireTimer); }catch(e){}
+                log('queue buffering', { key });
+                try{ activateNextSender(); }catch(e){}
+              }
               if (!info.acked){
-                if (info.queue.length < 1000) info.queue.push(chunk);
-                else log('pending queue full - dropping chunk', key);
+                // buffer until ACK from speaker (no hard limit)
+                info.queue.push(chunk);
               } else {
                 if (!info.coalesceBuffer) info.coalesceBuffer = [];
                 info.coalesceBuffer.push(chunk);
@@ -567,7 +662,7 @@ async function autoJoinTo(guildId, channelId) {
           opusStream.on('end', ()=>{
             info.ended = true;
             try{ flushCoalesce(info); }catch(e){}
-            if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); try{ pendingQueues.delete(key); }catch(e){} }
+            if (info.acked){ if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); try{ pausePendingQueue(key); }catch(e){} }
             else { if (ws && ws.readyState === WebSocket.OPEN){ log('ws send', 'audio-end (pre-ack)', userId, 'source=', announceId); ws.send(JSON.stringify({ type: 'audio-end', userId, source: announceId })); } else log('ws not open - audio-end', userId); }
             if (activeSenderKey === key){ activeSenderKey = null; activateNextSender(); }
           });

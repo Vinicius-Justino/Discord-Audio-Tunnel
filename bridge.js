@@ -1,15 +1,14 @@
-// Simple WebSocket hub for local audio relay
-// Usage: node bridge.js
-// Listens on ws://0.0.0.0:8080 by default
+// bridge.js - minimal WebSocket hub for local audio relay
+// Usage: node bridge.js  (listens on ws://0.0.0.0:8080)
 
 const WebSocket = require('ws');
 const wss = new WebSocket.Server({ port: 8080 });
 
-// clients: { id -> { ws, role, clientId } }
+// Connected clients by announced id. Some sockets start with a temporary id.
 const clients = new Map();
-// buffered binary frames per source id when audio-start not yet seen by hub
+// Buffered binary frames for a source until an `audio-start` control arrives.
 const buffered = new Map();
-// tracks which sources have announced audio-start (so we can forward binaries immediately)
+// Sources that have sent `audio-start` and can receive forwarded binaries immediately.
 const audioStarted = new Set();
 
 function log(...args){ console.log(new Date().toISOString(), ...args); }
@@ -21,8 +20,7 @@ wss.on('connection', (ws) => {
   log('[connect]', meta.id, 'clients=', clients.size);
 
   ws.on('message', (data) => {
-    // JSON control frames may arrive as strings or as Buffers containing UTF-8 JSON text;
-    // audio frames are binary Buffers that are not JSON.
+    // Control frames are JSON (string or UTF-8 Buffer). Audio frames are binary Buffers.
     let text = null;
     if (typeof data === 'string' || data instanceof String) {
       text = data;
@@ -50,11 +48,11 @@ wss.on('connection', (ws) => {
           meta.id = announcedId;
           meta.role = msg.role;
           meta.clientId = msg.clientId;
-          // remove previous temp entry if different id
+          // replace temporary id with announced id
           if (prevId && clients.has(prevId) && prevId !== announcedId) clients.delete(prevId);
           clients.set(meta.id, { ws, role: meta.role, clientId: meta.clientId });
             log('[announce]', meta.id, meta.role, meta.clientId, 'clients=', clients.size);
-            // diagnostic: list known clients (short)
+            // (optional) diagnostic snapshot of known clients
             try{ log('[clients snapshot]', Array.from(clients.entries()).map(([id,c])=>({id,role:c.role})).slice(0,20)); }catch(e){}
           // notify others
           broadcast(JSON.stringify({ type: 'peer', id: meta.id, role: meta.role, clientId: meta.clientId }));
@@ -90,8 +88,7 @@ wss.on('connection', (ws) => {
             try { c.ws.send(JSON.stringify(msg)); log('[audio-control fwd]', 'to=', id, 'role=', c.role); } catch(e){ log('audio-control send err', e && e.message); }
           }
 
-          // flush any buffered binaries for this source after yielding to the event loop
-          // (gives speakers a chance to handle the audio-start JSON and create resources)
+          // Flush any buffered binaries for this source after yielding so speakers can prepare.
           const q = buffered.get(meta.id);
           if (q && q.length) {
             setImmediate(() => {
@@ -108,7 +105,7 @@ wss.on('connection', (ws) => {
         log('bad-json', e && e.message);
       }
     } else {
-      // binary: forward to all peers except sender, but ensure audio-start ordering
+      // Binary frames: forward to peers if `audio-start` seen for this source; otherwise buffer.
       const len = data && data.length ? data.length : 0;
       log('[binary rx]', 'from=', meta.id, 'len=', len, 'clients=', clients.size);
       if (audioStarted.has(meta.id)){
@@ -118,9 +115,8 @@ wss.on('connection', (ws) => {
         // buffer until we see audio-start from this meta.id
         let q = buffered.get(meta.id);
         if (!q) { q = []; buffered.set(meta.id, q); }
-        // safety: limit buffer length to avoid memory blowup
-        if (q.length < 1000) q.push(data);
-        else log('[buffer overflow]', 'dropping frame for', meta.id);
+        // Preserve all frames (no artificial size cap here).
+        q.push(data);
       }
     }
   });
