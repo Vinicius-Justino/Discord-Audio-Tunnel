@@ -33,28 +33,48 @@ Executando com `pm2`
 npm install
 ```
 
-2. Inicie o hub (bridge):
+2. Iniciar tudo via `ecosystem.config.js` (recomendado):
+
+```bash
+# inicia bridge, agentK e agentJ, atualiza envs e salva a lista
+pm2 start ecosystem.config.js --update-env && pm2 save && pm2 ls
+```
+
+Observações sobre tokens / variáveis de ambiente
+- Os agentes já resolvem tokens automaticamente (procura `--token`, `AGENT_K_TOKEN`, `AGENT_J_TOKEN`, `AGENT_TOKEN` ou no arquivo `.env`).
+- Para fornecer tokens no shell antes de (re)iniciar os processos:
+
+```bash
+export AGENT_K_TOKEN=xxxxx
+export AGENT_J_TOKEN=yyyy
+export HUB_URL=ws://127.0.0.1:8080
+pm2 restart ecosystem.config.js --update-env
+```
+
+3. Iniciar processos individualmente (opcional)
+
+- Iniciar apenas o hub (bridge):
 
 ```bash
 pm2 start bridge.js --name bridge
 ```
 
-3. Inicie um agente listener (exemplo `agentK`):
+- Iniciar um agente listener (exemplo `agentK`):
 
 ```bash
 AGENT_K_TOKEN=xxxxx HUB_URL=ws://127.0.0.1:8080 pm2 start agent.js --name agentK -- --input --name agentK
 ```
 
-4. Inicie um agente speaker (exemplo `agentJ`):
+- Iniciar um agente speaker (exemplo `agentJ`):
 
 ```bash
 AGENT_J_TOKEN=yyyy HUB_URL=ws://127.0.0.1:8080 pm2 start agent.js --name agentJ -- --output --name agentJ
 ```
 
-5. Reiniciar/atualizar envs:
+Atualizar variáveis de ambiente / reiniciar (usa o `ecosystem`):
 
 ```bash
-pm2 restart agentK agentJ bridge --update-env
+pm2 restart ecosystem.config.js --update-env
 ```
 
 Comandos Discord (via chat)
